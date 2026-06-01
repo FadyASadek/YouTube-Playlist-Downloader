@@ -36,6 +36,7 @@ class YouTubeDownloaderApp(ctk.CTk):
         self.current_video_index = 0
         self.playlist_estimated_size = "Unknown"
         self.video_list_labels = {}
+        self.video_list_titles = {}
         self.video_list_vars = {}
 
         # Build UI
@@ -76,7 +77,7 @@ class YouTubeDownloaderApp(ctk.CTk):
         
         self.quality_var = ctk.StringVar(value="720p")
         self.quality_menu = ctk.CTkOptionMenu(self.sidebar_frame, variable=self.quality_var, 
-                                              values=["1080p (Requires FFmpeg)", "720p", "480p", "Audio Only (MP3)"],
+                                              values=["1080p (FFmpeg)", "720p (FFmpeg)", "480p (FFmpeg)", "Audio Only (MP3)"],
                                               command=lambda _: self.save_settings())
         self.quality_menu.grid(row=8, column=0, sticky="ew", padx=20, pady=(0, 10))
         
@@ -189,7 +190,15 @@ class YouTubeDownloaderApp(ctk.CTk):
                         self.dir_entry.insert(0, settings['save_dir'])
                         self.dir_entry.configure(state="readonly")
                     if 'quality' in settings:
-                        self.quality_var.set(settings['quality'])
+                        # Migrate old quality names to new labels
+                        quality_migration = {
+                            '1080p (Requires FFmpeg)': '1080p (FFmpeg)',
+                            '1080p': '1080p (FFmpeg)',
+                            '720p': '720p (FFmpeg)',
+                            '480p': '480p (FFmpeg)',
+                        }
+                        q = settings['quality']
+                        self.quality_var.set(quality_migration.get(q, q))
                     if 'subtitles' in settings:
                         self.subtitles_var.set(settings['subtitles'])
                     if 'thumbnails' in settings:
@@ -255,11 +264,14 @@ class YouTubeDownloaderApp(ctk.CTk):
         for widget in self.video_list_frame.winfo_children():
             widget.destroy()
         self.video_list_labels.clear()
+        self.video_list_titles.clear()
         self.video_list_vars.clear()
         
         for index_tuple, entry in entries:
             title = entry.get('title', f'Video {index_tuple}')
             if len(title) > 75: title = title[:72] + "..."
+            
+            base_text = f"{index_tuple:02d} - {title}"
             
             row_frame = ctk.CTkFrame(self.video_list_frame, fg_color="transparent")
             row_frame.grid(row=index_tuple, column=0, sticky="ew", pady=2, padx=5)
@@ -270,18 +282,18 @@ class YouTubeDownloaderApp(ctk.CTk):
             chk = ctk.CTkCheckBox(row_frame, text="", variable=var, width=24)
             chk.pack(side="left")
             
-            lbl = ctk.CTkLabel(row_frame, text=f"⏳ {index_tuple:02d} - {title}", anchor="w")
+            lbl = ctk.CTkLabel(row_frame, text=f"⏳ {base_text}", anchor="w")
             lbl.pack(side="left", fill="x", expand=True)
             
             self.video_list_labels[index_tuple] = lbl
+            self.video_list_titles[index_tuple] = base_text
 
     def update_video_status(self, index, status_icon, color=None):
         def _update():
             if index in self.video_list_labels:
                 lbl = self.video_list_labels[index]
-                text = lbl.cget("text")
-                new_text = status_icon + text[1:]
-                lbl.configure(text=new_text)
+                base_text = self.video_list_titles.get(index, "")
+                lbl.configure(text=f"{status_icon} {base_text}")
                 if color:
                     lbl.configure(text_color=color)
         self.after(0, _update)
@@ -406,17 +418,20 @@ class YouTubeDownloaderApp(ctk.CTk):
             'progress_hooks': [self.ydl_progress_hook],
             'nocheckcertificate': True,
             'ignoreerrors': True,
+            'continuedl': True,
             'quiet': True,
             'no_warnings': True,
         }
 
         if "1080p" in quality:
-            opts['format'] = 'bestvideo[height<=1080]+bestaudio/best'
+            opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
             opts['merge_output_format'] = 'mkv'
         elif "720p" in quality:
-            opts['format'] = 'best[height<=720]/best'
+            opts['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+            opts['merge_output_format'] = 'mkv'
         elif "480p" in quality:
-            opts['format'] = 'best[height<=480]/best'
+            opts['format'] = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
+            opts['merge_output_format'] = 'mkv'
         elif "Audio Only" in quality:
             opts['format'] = 'bestaudio/best'
             opts['postprocessors'] = [{
@@ -466,7 +481,22 @@ class YouTubeDownloaderApp(ctk.CTk):
             downloaded = d.get('downloaded_bytes', 0)
             
             if total_bytes > 0:
-                percent = downloaded / total_bytes
+                raw_percent = downloaded / total_bytes
+                
+                # For bestvideo+bestaudio, yt-dlp downloads two streams sequentially.
+                # Weight video stream as 80% and audio as 20% to prevent the
+                # progress bar from jumping backwards when the audio stream starts.
+                if self._is_multi_stream:
+                    if self._stream_count == 0:
+                        percent = raw_percent * 0.8
+                        stream_label = "Video"
+                    else:
+                        percent = 0.8 + raw_percent * 0.2
+                        stream_label = "Audio"
+                else:
+                    percent = raw_percent
+                    stream_label = "Size"
+                
                 self.update_progress_safe(self.video_prog_bar, percent, self.video_pct_label, f"{percent*100:.1f}%")
                 
                 # Proportional Total Progress
@@ -477,31 +507,39 @@ class YouTubeDownloaderApp(ctk.CTk):
                 speed = self.format_speed(d.get('speed'))
                 eta = self.format_eta(d.get('eta'))
                 
-                def update_stats():
-                    self.stats_label.configure(text=f"Size: {self.format_bytes(total_bytes)} | Speed: {speed} | ETA: {eta}")
+                def update_stats(sl=stream_label, tb=total_bytes, sp=speed, et=eta):
+                    self.stats_label.configure(text=f"{sl}: {self.format_bytes(tb)} | Speed: {sp} | ETA: {et}")
                 self.after(0, update_stats)
 
         elif d['status'] == 'finished':
+            self._stream_count += 1
             filename = d.get('filename', 'Video')
-            self.log_message(f"Finished downloading: {os.path.basename(filename)}")
-            self.update_progress_safe(self.video_prog_bar, 1.0, self.video_pct_label, "100%")
             
-            if hasattr(self, 'total_selected') and hasattr(self, 'current_loop_index') and self.total_selected > 0:
-                total_percent = (self.current_loop_index + 1.0) / self.total_selected
-                self.update_progress_safe(self.playlist_prog_bar, total_percent, self.playlist_pct_label, f"{total_percent*100:.1f}%")
+            if self._is_multi_stream and self._stream_count == 1:
+                # First stream (video) done — audio stream coming next
+                self.log_message(f"Video stream downloaded, fetching audio...")
+                self.update_progress_safe(self.video_prog_bar, 0.8, self.video_pct_label, "80%")
+            else:
+                # Single stream finished, or final stream of multi-stream
+                self.log_message(f"Finished downloading: {os.path.basename(filename)}")
+                self.update_progress_safe(self.video_prog_bar, 1.0, self.video_pct_label, "100%")
                 
-            self.after(0, lambda: self.stats_label.configure(text="Merging audio & video..."))
+                if hasattr(self, 'total_selected') and hasattr(self, 'current_loop_index') and self.total_selected > 0:
+                    total_percent = (self.current_loop_index + 1.0) / self.total_selected
+                    self.update_progress_safe(self.playlist_prog_bar, total_percent, self.playlist_pct_label, f"{total_percent*100:.1f}%")
+                
+                if self._is_multi_stream:
+                    self.after(0, lambda: self.stats_label.configure(text="Merging audio & video..."))
 
         elif d['status'] == 'postprocessing' or d['status'] == 'processing':
             self.after(0, lambda: self.stats_label.configure(text="Post-processing (merging)..."))
 
     def download_process(self, save_dir, quality, entries_to_dl):
         try:
-            needs_ffmpeg = ("1080p" in quality or "Audio Only" in quality or self.thumbnail_var.get())
-            if needs_ffmpeg and shutil.which("ffmpeg") is None:
+            if shutil.which("ffmpeg") is None:
                 err = ("FFmpeg is not installed or not in PATH!\n\n"
-                       "You selected a quality or feature (Thumbnails/1080p/MP3) that requires FFmpeg.\n"
-                       "Please install FFmpeg or disable Thumbnails and select '720p' or '480p'.")
+                       "FFmpeg is required for downloading and merging video+audio streams.\n"
+                       "Please install FFmpeg and make sure it's in your system PATH.")
                 self.after(0, lambda: messagebox.showerror("FFmpeg Missing", err))
                 self.reset_ui()
                 return
@@ -544,7 +582,11 @@ class YouTubeDownloaderApp(ctk.CTk):
                                     if h > max_height:
                                         max_height = h
                             
-                            if max_height > 0 and max_height < requested_height:
+                            # Use a tolerance (10%) because YouTube often encodes at
+                            # non-standard heights (e.g. 1020p instead of 1080p).
+                            # yt-dlp's format selector uses <=, so 1020p satisfies height<=1080.
+                            tolerance = requested_height * 0.10
+                            if max_height > 0 and max_height < (requested_height - tolerance):
                                 sorted_heights = sorted(available_heights, reverse=True)
                                 available_str = ", ".join([f"{h}p" for h in sorted_heights[:5]])
                                 err_msg = (
@@ -553,7 +595,7 @@ class YouTubeDownloaderApp(ctk.CTk):
                                     f"Available qualities: {available_str}\n\n"
                                     f"Please go back and select a different quality."
                                 )
-                                self.after(0, lambda: messagebox.showwarning("Quality Not Available", err_msg))
+                                self.after(0, lambda msg=err_msg: messagebox.showwarning("Quality Not Available", msg))
                                 self.log_message(f"⚠️ {requested_height}p not available. Max: {max_height}p. Download stopped.")
                                 self.reset_ui()
                                 return
@@ -590,6 +632,8 @@ class YouTubeDownloaderApp(ctk.CTk):
                 self.update_progress_safe(self.video_prog_bar, 0, self.video_pct_label, "0%")
                 
                 ydl_opts = self.get_ydl_opts(quality, save_dir, self.current_video_index)
+                self._stream_count = 0
+                self._is_multi_stream = '+' in ydl_opts.get('format', '')
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     try:
                         ydl.download([video_url])
@@ -630,6 +674,7 @@ class YouTubeDownloaderApp(ctk.CTk):
                 else:
                     self.log_message("All downloads completed successfully!")
                     self.update_ui_safe(self.video_info_label, text="Completed!")
+                    self.cleanup_temp_files(save_dir)
                     self.after(0, lambda: messagebox.showinfo("Success", "Download process finished!"))
 
         except Exception as e:
