@@ -9,9 +9,47 @@ from tkinter import messagebox, filedialog
 import customtkinter as ctk
 import yt_dlp
 
-# Settings file is always next to the script
-SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+# Support both PyInstaller frozen executable and standard Python script
+if getattr(sys, 'frozen', False):
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 SETTINGS_FILE = os.path.join(SCRIPT_DIR, 'settings.json')
+
+def ensure_ffmpeg_in_path():
+    """Auto-detect ffmpeg in script dir, WinGet packages, or standard paths and append to PATH."""
+    if shutil.which("ffmpeg"):
+        return True
+        
+    candidate_dirs = [
+        SCRIPT_DIR,
+        os.path.join(SCRIPT_DIR, 'ffmpeg'),
+        os.path.join(SCRIPT_DIR, 'bin'),
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'WinGet', 'Links'),
+        r"C:\Program Files\FFmpeg\bin",
+        r"C:\ffmpeg\bin"
+    ]
+    
+    # Also search user LocalAppData WinGet packages
+    winget_pkgs = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'WinGet', 'Packages')
+    if os.path.exists(winget_pkgs):
+        try:
+            for root, dirs, files in os.walk(winget_pkgs):
+                if 'ffmpeg.exe' in files:
+                    candidate_dirs.append(root)
+                    break
+        except Exception:
+            pass
+                
+    for d in candidate_dirs:
+        if d and os.path.exists(os.path.join(d, 'ffmpeg.exe')):
+            os.environ['PATH'] = d + os.pathsep + os.environ.get('PATH', '')
+            if shutil.which("ffmpeg"):
+                return True
+    return False
+
+ensure_ffmpeg_in_path()
 
 class CancelDownloadException(Exception):
     pass
@@ -82,18 +120,37 @@ class YouTubeDownloaderApp(ctk.CTk):
         self.quality_menu.grid(row=8, column=0, sticky="ew", padx=20, pady=(0, 10))
         
         self.subtitles_var = ctk.BooleanVar(value=False)
-        self.subs_check = ctk.CTkCheckBox(self.sidebar_frame, text="Download Subtitles", variable=self.subtitles_var, command=self.save_settings)
-        self.subs_check.grid(row=9, column=0, sticky="w", padx=20, pady=5)
+        self.subs_check = ctk.CTkCheckBox(self.sidebar_frame, text="Download Subtitles (CC)", variable=self.subtitles_var, command=self.on_subs_toggle)
+        self.subs_check.grid(row=9, column=0, sticky="w", padx=20, pady=(5, 2))
+        
+        self.auto_subtitles_var = ctk.BooleanVar(value=True)
+        self.auto_subs_check = ctk.CTkCheckBox(self.sidebar_frame, text="↳ Auto CC (تلقائي)", variable=self.auto_subtitles_var, 
+                                               font=ctk.CTkFont(size=12), text_color="gray80",
+                                               command=self.save_settings)
+        self.auto_subs_check.grid(row=10, column=0, sticky="w", padx=(35, 20), pady=2)
+        
+        self.embed_subtitles_var = ctk.BooleanVar(value=True)
+        self.embed_subs_check = ctk.CTkCheckBox(self.sidebar_frame, text="↳ Embed CC in Video (دمج)", variable=self.embed_subtitles_var, 
+                                                font=ctk.CTkFont(size=12), text_color="gray80",
+                                                command=self.save_settings)
+        self.embed_subs_check.grid(row=11, column=0, sticky="w", padx=(35, 20), pady=2)
+
+        self.sub_lang_var = ctk.StringVar(value="Arabic + English")
+        self.sub_lang_menu = ctk.CTkOptionMenu(self.sidebar_frame, variable=self.sub_lang_var,
+                                               values=["Arabic + English", "Arabic Only", "English Only", "All Languages"],
+                                               height=26, font=ctk.CTkFont(size=12),
+                                               command=lambda _: self.save_settings())
+        self.sub_lang_menu.grid(row=12, column=0, sticky="ew", padx=(35, 20), pady=(2, 8))
         
         self.thumbnail_var = ctk.BooleanVar(value=False)
         self.thumb_check = ctk.CTkCheckBox(self.sidebar_frame, text="Embed Thumbnail", variable=self.thumbnail_var, command=self.save_settings)
-        self.thumb_check.grid(row=10, column=0, sticky="w", padx=20, pady=(5, 20))
+        self.thumb_check.grid(row=13, column=0, sticky="w", padx=20, pady=(5, 15))
 
-        self.sidebar_frame.grid_rowconfigure(11, weight=1) # Spacer
+        self.sidebar_frame.grid_rowconfigure(14, weight=1) # Spacer
         
         # 5. Open Folder Button
         self.open_folder_btn = ctk.CTkButton(self.sidebar_frame, text="📂 Open Folder", command=self.open_folder, fg_color="#2fa572", hover_color="#23855a")
-        self.open_folder_btn.grid(row=12, column=0, sticky="ew", padx=20, pady=(0, 20))
+        self.open_folder_btn.grid(row=15, column=0, sticky="ew", padx=20, pady=(0, 20))
 
         # --- Main Workspace Frame (Right) ---
         self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -167,11 +224,24 @@ class YouTubeDownloaderApp(ctk.CTk):
     def show_context_menu(self, event):
         self.context_menu.tk_popup(event.x_root, event.y_root)
 
+    def on_subs_toggle(self):
+        is_enabled = self.subtitles_var.get()
+        state = "normal" if is_enabled else "disabled"
+        text_color = "gray80" if is_enabled else "gray40"
+        
+        self.auto_subs_check.configure(state=state, text_color=text_color)
+        self.embed_subs_check.configure(state=state, text_color=text_color)
+        self.sub_lang_menu.configure(state=state)
+        self.save_settings()
+
     def save_settings(self):
         settings = {
             'save_dir': self.dir_entry.get(),
             'quality': self.quality_var.get(),
             'subtitles': self.subtitles_var.get(),
+            'auto_subtitles': self.auto_subtitles_var.get(),
+            'embed_subtitles': self.embed_subtitles_var.get(),
+            'sub_lang': self.sub_lang_var.get(),
             'thumbnails': self.thumbnail_var.get()
         }
         try:
@@ -201,10 +271,17 @@ class YouTubeDownloaderApp(ctk.CTk):
                         self.quality_var.set(quality_migration.get(q, q))
                     if 'subtitles' in settings:
                         self.subtitles_var.set(settings['subtitles'])
+                    if 'auto_subtitles' in settings:
+                        self.auto_subtitles_var.set(settings['auto_subtitles'])
+                    if 'embed_subtitles' in settings:
+                        self.embed_subtitles_var.set(settings['embed_subtitles'])
+                    if 'sub_lang' in settings:
+                        self.sub_lang_var.set(settings['sub_lang'])
                     if 'thumbnails' in settings:
                         self.thumbnail_var.set(settings['thumbnails'])
         except:
             pass
+        self.on_subs_toggle()
 
     def cleanup_temp_files(self, save_dir):
         """Remove leftover .part files and orphaned separate streams from failed downloads."""
@@ -443,7 +520,30 @@ class YouTubeDownloaderApp(ctk.CTk):
             
         if self.subtitles_var.get():
             opts['writesubtitles'] = True
-            opts['subtitleslangs'] = ['ar', 'en']
+            if self.auto_subtitles_var.get():
+                opts['writeautomaticsub'] = True
+            
+            lang_val = self.sub_lang_var.get()
+            if "Arabic Only" in lang_val:
+                opts['subtitleslangs'] = ['ar', 'ar.*']
+            elif "English Only" in lang_val:
+                opts['subtitleslangs'] = ['en', 'en.*']
+            elif "All" in lang_val:
+                opts['subtitleslangs'] = ['all']
+            else: # Default: Arabic + English
+                opts['subtitleslangs'] = ['ar', 'ar.*', 'en', 'en.*']
+                
+            opts['subtitlesformat'] = 'srt/best'
+            
+            if 'postprocessors' not in opts:
+                opts['postprocessors'] = []
+                
+            # Convert downloaded subtitles to SRT for universal compatibility
+            opts['postprocessors'].append({'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'})
+            
+            # Embed into video file if not Audio Only and Embed CC is enabled
+            if "Audio Only" not in quality and self.embed_subtitles_var.get():
+                opts['postprocessors'].append({'key': 'FFmpegEmbedSubtitle', 'already_have_subtitle': False})
             
         if self.thumbnail_var.get():
             opts['writethumbnail'] = True
@@ -536,10 +636,10 @@ class YouTubeDownloaderApp(ctk.CTk):
 
     def download_process(self, save_dir, quality, entries_to_dl):
         try:
-            if shutil.which("ffmpeg") is None:
+            if not ensure_ffmpeg_in_path():
                 err = ("FFmpeg is not installed or not in PATH!\n\n"
                        "FFmpeg is required for downloading and merging video+audio streams.\n"
-                       "Please install FFmpeg and make sure it's in your system PATH.")
+                       "Please install FFmpeg or place ffmpeg.exe next to the program.")
                 self.after(0, lambda: messagebox.showerror("FFmpeg Missing", err))
                 self.reset_ui()
                 return
