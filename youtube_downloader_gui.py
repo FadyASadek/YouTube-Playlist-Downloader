@@ -130,16 +130,36 @@ def translate_srt_file(input_srt_path, output_srt_path, target='ar', progress_ca
     except Exception:
         return False
 
-def embed_subtitle_to_video(video_file, srt_file, lang='ara', title='Arabic (ترجمة عربية)'):
-    temp_out = video_file + ".temp_sub.mkv"
+def extract_subtitle_from_video(video_file, output_srt):
     try:
-        cmd = [
-            'ffmpeg', '-y', '-i', video_file, '-i', srt_file,
-            '-c', 'copy', '-c:s', 'srt',
-            '-metadata:s:s:0', f'language={lang}',
-            '-metadata:s:s:0', f'title={title}',
-            temp_out
-        ]
+        cmd = ['ffmpeg', '-y', '-i', video_file, '-map', '0:s:0', '-c:s', 'srt', output_srt]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        return res.returncode == 0 and os.path.exists(output_srt) and os.path.getsize(output_srt) > 0
+    except Exception:
+        return False
+
+def embed_subtitles_to_video(video_file, subtitle_tracks):
+    if not os.path.exists(video_file) or not subtitle_tracks:
+        return False
+    
+    valid_tracks = [t for t in subtitle_tracks if os.path.exists(t[0])]
+    if not valid_tracks:
+        return False
+        
+    temp_out = video_file + ".temp_sub.mkv"
+    cmd = ['ffmpeg', '-y', '-i', video_file]
+    for srt_path, _, _ in valid_tracks:
+        cmd.extend(['-i', srt_path])
+        
+    cmd.extend(['-c', 'copy', '-c:s', 'srt'])
+    for idx, (_, lang, title) in enumerate(valid_tracks):
+        cmd.extend([
+            f'-metadata:s:s:{idx}', f'language={lang}',
+            f'-metadata:s:s:{idx}', f'title={title}'
+        ])
+    cmd.append(temp_out)
+    
+    try:
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         if res.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
             os.replace(temp_out, video_file)
@@ -643,10 +663,6 @@ class YouTubeDownloaderApp(ctk.CTk):
             # Convert downloaded subtitles to SRT for universal compatibility
             opts['postprocessors'].append({'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'})
             
-            # Embed into video file if not Audio Only and Embed CC is enabled
-            if "Audio Only" not in quality and self.embed_subtitles_var.get():
-                opts['postprocessors'].append({'key': 'FFmpegEmbedSubtitle', 'already_have_subtitle': False})
-            
         if self.thumbnail_var.get():
             opts['writethumbnail'] = True
             if 'postprocessors' not in opts:
@@ -840,29 +856,51 @@ class YouTubeDownloaderApp(ctk.CTk):
                     try:
                         ydl.download([video_url])
 
-                        # Check for auto-translating to Arabic if requested
-                        if self.subtitles_var.get() and ("Arabic" in self.sub_lang_var.get()):
+                        # Process subtitles & auto-translate to Arabic if requested
+                        if self.subtitles_var.get():
                             index_str = str(self.current_video_index).zfill(2)
                             video_matches = glob.glob(os.path.join(save_dir, f"{index_str} - *.mkv")) + glob.glob(os.path.join(save_dir, f"{index_str} - *.mp4"))
-                            ar_subs = glob.glob(os.path.join(save_dir, f"{index_str} - *.ar.srt")) + glob.glob(os.path.join(save_dir, f"{index_str} - *.ar.vtt"))
-                            en_subs = [f for f in glob.glob(os.path.join(save_dir, f"{index_str} - *.*")) if any(ext in f for ext in ['.en.srt', '.en-orig.srt', '.en.vtt', '.en-orig.vtt'])]
                             
-                            # If no native Arabic subtitles, but English is available, translate it!
-                            if not ar_subs and en_subs and video_matches:
+                            if video_matches:
                                 video_file = video_matches[0]
                                 base_no_ext = os.path.splitext(video_file)[0]
+                                
+                                ar_subs = glob.glob(os.path.join(save_dir, f"{index_str} - *.ar.srt")) + glob.glob(os.path.join(save_dir, f"{index_str} - *.ar.vtt"))
+                                en_subs = [f for f in glob.glob(os.path.join(save_dir, f"{index_str} - *.*")) if any(ext in f for ext in ['.en.srt', '.en-orig.srt', '.en.vtt', '.en-orig.vtt'])]
+                                
+                                # If no en_subs file on disk, extract from video stream if already embedded
+                                if not en_subs and not ar_subs:
+                                    temp_extracted = f"{base_no_ext}.en.srt"
+                                    if extract_subtitle_from_video(video_file, temp_extracted):
+                                        en_subs = [temp_extracted]
+                                
+                                # Auto-translate to Arabic if requested and no native Arabic
                                 target_ar_srt = f"{base_no_ext}.ar.srt"
-                                source_en_sub = en_subs[0]
+                                if ("Arabic" in self.sub_lang_var.get()) and not ar_subs and en_subs:
+                                    self.log_message(f"Auto-translating subtitles to Arabic for {title}...")
+                                    self.after(0, lambda: self.stats_label.configure(text="Translating subtitles to Arabic..."))
+                                    
+                                    if translate_srt_file(en_subs[0], target_ar_srt, target='ar'):
+                                        self.log_message(f"✅ Arabic subtitles created: {os.path.basename(target_ar_srt)}")
+                                        ar_subs = [target_ar_srt]
+                                        # Also keep a default .srt copy matching video name
+                                        try:
+                                            shutil.copyfile(target_ar_srt, f"{base_no_ext}.srt")
+                                        except Exception:
+                                            pass
                                 
-                                self.log_message(f"Auto-translating subtitles to Arabic for {title}...")
-                                self.after(0, lambda: self.stats_label.configure(text="Translating subtitles to Arabic..."))
-                                
-                                if translate_srt_file(source_en_sub, target_ar_srt, target='ar'):
-                                    self.log_message(f"✅ Arabic subtitles created: {os.path.basename(target_ar_srt)}")
-                                    if self.embed_subtitles_var.get():
-                                        self.log_message("Embedding Arabic subtitles into video...")
-                                        embed_subtitle_to_video(video_file, target_ar_srt, lang='ara', title='Arabic (ترجمة عربية)')
-                                        self.log_message("✅ Arabic subtitles embedded into video successfully!")
+                                # Embed subtitles into the video container
+                                if self.embed_subtitles_var.get() and "Audio Only" not in quality:
+                                    tracks = []
+                                    if ar_subs:
+                                        tracks.append((ar_subs[0], 'ara', 'Arabic (ترجمة عربية)'))
+                                    if "Arabic Only" not in self.sub_lang_var.get() and en_subs:
+                                        tracks.append((en_subs[0], 'eng', 'English (Original)'))
+                                    
+                                    if tracks:
+                                        self.log_message("Embedding subtitles into video...")
+                                        if embed_subtitles_to_video(video_file, tracks):
+                                            self.log_message("✅ Subtitles embedded into video successfully!")
 
                         self.update_video_status(self.current_video_index, "✅", "#2fa572")
                         self.update_ui_safe(self.video_prog_bar, progress_color="#2fa572")
