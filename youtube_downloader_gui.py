@@ -4,6 +4,11 @@ import glob
 import shutil
 import threading
 import json
+import re
+import urllib.request
+import urllib.parse
+import subprocess
+import time
 import tkinter as tk
 from tkinter import messagebox, filedialog
 import customtkinter as ctk
@@ -50,6 +55,102 @@ def ensure_ffmpeg_in_path():
     return False
 
 ensure_ffmpeg_in_path()
+
+def parse_srt(srt_text):
+    blocks = re.split(r'\n\s*\n', srt_text.strip())
+    subtitles = []
+    for b in blocks:
+        lines = [l.strip() for l in b.strip().split('\n') if l.strip()]
+        if len(lines) >= 3:
+            idx = lines[0]
+            timing = lines[1]
+            text = ' '.join(lines[2:])
+            subtitles.append({'idx': idx, 'timing': timing, 'text': text})
+    return subtitles
+
+def translate_texts(texts, target='ar'):
+    combined = ' ||| '.join(texts)
+    try:
+        url = f'https://translate.googleapis.com/translate_a/single?client=dict-chrome-ex&sl=auto&tl={target}&dt=t&q=' + urllib.parse.quote(combined)
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            full_res = ''.join([part[0] for part in data[0] if part[0]])
+            parts = [p.strip() for p in full_res.split('|||')]
+            if len(parts) == len(texts):
+                return parts
+    except Exception:
+        pass
+
+    # Fallback line by line
+    results = []
+    for t in texts:
+        try:
+            url = f'https://translate.googleapis.com/translate_a/single?client=dict-chrome-ex&sl=auto&tl={target}&dt=t&q=' + urllib.parse.quote(t)
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                results.append(''.join([part[0] for part in data[0] if part[0]]))
+        except Exception:
+            results.append(t)
+    return results
+
+def translate_srt_file(input_srt_path, output_srt_path, target='ar', progress_callback=None):
+    try:
+        with open(input_srt_path, 'r', encoding='utf-8', errors='ignore') as f:
+            srt_content = f.read()
+
+        subs = parse_srt(srt_content)
+        if not subs:
+            return False
+
+        chunk_size = 30
+        total_subs = len(subs)
+        translated_subs = []
+
+        for i in range(0, total_subs, chunk_size):
+            chunk = subs[i:i+chunk_size]
+            texts = [s['text'] for s in chunk]
+            trans_texts = translate_texts(texts, target)
+            for s, trans in zip(chunk, trans_texts):
+                translated_subs.append({'idx': s['idx'], 'timing': s['timing'], 'text': trans})
+            
+            if progress_callback:
+                progress_callback(min(i + chunk_size, total_subs), total_subs)
+            time.sleep(0.08)
+
+        output_lines = []
+        for s in translated_subs:
+            output_lines.append(f"{s['idx']}\n{s['timing']}\n{s['text']}\n")
+
+        with open(output_srt_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(output_lines))
+
+        return True
+    except Exception:
+        return False
+
+def embed_subtitle_to_video(video_file, srt_file, lang='ara', title='Arabic (ترجمة عربية)'):
+    temp_out = video_file + ".temp_sub.mkv"
+    try:
+        cmd = [
+            'ffmpeg', '-y', '-i', video_file, '-i', srt_file,
+            '-c', 'copy', '-c:s', 'srt',
+            '-metadata:s:s:0', f'language={lang}',
+            '-metadata:s:s:0', f'title={title}',
+            temp_out
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if res.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+            os.replace(temp_out, video_file)
+            return True
+    except Exception:
+        pass
+    finally:
+        if os.path.exists(temp_out):
+            try: os.remove(temp_out)
+            except: pass
+    return False
 
 class CancelDownloadException(Exception):
     pass
@@ -525,7 +626,8 @@ class YouTubeDownloaderApp(ctk.CTk):
             
             lang_val = self.sub_lang_var.get()
             if "Arabic Only" in lang_val:
-                opts['subtitleslangs'] = ['ar', 'ar.*']
+                # Request Arabic and English fallback so we can translate if Arabic isn't uploaded
+                opts['subtitleslangs'] = ['ar', 'ar.*', 'en', 'en.*']
             elif "English Only" in lang_val:
                 opts['subtitleslangs'] = ['en', 'en.*']
             elif "All" in lang_val:
@@ -737,6 +839,31 @@ class YouTubeDownloaderApp(ctk.CTk):
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     try:
                         ydl.download([video_url])
+
+                        # Check for auto-translating to Arabic if requested
+                        if self.subtitles_var.get() and ("Arabic" in self.sub_lang_var.get()):
+                            index_str = str(self.current_video_index).zfill(2)
+                            video_matches = glob.glob(os.path.join(save_dir, f"{index_str} - *.mkv")) + glob.glob(os.path.join(save_dir, f"{index_str} - *.mp4"))
+                            ar_subs = glob.glob(os.path.join(save_dir, f"{index_str} - *.ar.srt")) + glob.glob(os.path.join(save_dir, f"{index_str} - *.ar.vtt"))
+                            en_subs = [f for f in glob.glob(os.path.join(save_dir, f"{index_str} - *.*")) if any(ext in f for ext in ['.en.srt', '.en-orig.srt', '.en.vtt', '.en-orig.vtt'])]
+                            
+                            # If no native Arabic subtitles, but English is available, translate it!
+                            if not ar_subs and en_subs and video_matches:
+                                video_file = video_matches[0]
+                                base_no_ext = os.path.splitext(video_file)[0]
+                                target_ar_srt = f"{base_no_ext}.ar.srt"
+                                source_en_sub = en_subs[0]
+                                
+                                self.log_message(f"Auto-translating subtitles to Arabic for {title}...")
+                                self.after(0, lambda: self.stats_label.configure(text="Translating subtitles to Arabic..."))
+                                
+                                if translate_srt_file(source_en_sub, target_ar_srt, target='ar'):
+                                    self.log_message(f"✅ Arabic subtitles created: {os.path.basename(target_ar_srt)}")
+                                    if self.embed_subtitles_var.get():
+                                        self.log_message("Embedding Arabic subtitles into video...")
+                                        embed_subtitle_to_video(video_file, target_ar_srt, lang='ara', title='Arabic (ترجمة عربية)')
+                                        self.log_message("✅ Arabic subtitles embedded into video successfully!")
+
                         self.update_video_status(self.current_video_index, "✅", "#2fa572")
                         self.update_ui_safe(self.video_prog_bar, progress_color="#2fa572")
                     except CancelDownloadException:
